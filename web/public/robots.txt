@@ -1,0 +1,7 @@
+User-agent: *
+Allow: /
+Disallow: /api/
+Disallow: /portal
+Disallow: /connect/
+
+Sitemap: https://relaya.sbs/sitemap.xml

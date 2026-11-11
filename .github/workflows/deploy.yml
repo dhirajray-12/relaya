@@ -1,0 +1,137 @@
+name: Deploy
+
+# Every push to main is tested, built for the Windows/IIS server and published as
+# the "production" release. The server pulls it: a scheduled task there
+# (backend/deploy/iis/autodeploy.ps1) checks this release every few minutes,
+# verifies the package's SHA-256, deploys it with setup.ps1, checks /api/healthz and
+# rolls back if it fails. Nothing on the server is opened to the internet, and no
+# GitHub runner ever gets access to it.
+#
+# To approve each deploy by hand: Settings → Environments → production → Required
+# reviewers. Without rules the environment publishes straight away.
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: deploy-production
+  cancel-in-progress: false
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_USER: relaya
+          POSTGRES_PASSWORD: relaya
+          POSTGRES_DB: relaya_test
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U relaya" --health-interval 3s --health-retries 20
+    env:
+      TEST_DATABASE_URL: postgres://relaya:relaya@localhost:5432/relaya_test?sslmode=disable
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: backend/go.mod
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      # The same checks as backend.yml and web.yml, which skip main so nothing runs twice.
+      - name: Backend tests (with the database)
+        working-directory: backend
+        run: |
+          test -z "$(gofmt -l .)" || (gofmt -l . && exit 1)
+          go vet ./...
+          go test -race ./...
+      # The build itself happens once, in the package job.
+      - name: Dashboard type check and lint
+        working-directory: web
+        run: npm ci && npx tsc -b && npm run lint
+
+  package:
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: backend/go.mod
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      - name: Build for the Windows server
+        run: |
+          set -eu
+          mkdir -p pkg/dist pkg/web pkg/deploy
+          (cd backend && CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go build -trimpath -o ../pkg/dist/ ./cmd/...)
+          (cd web && npm ci && npm run build)
+          cp -r web/dist/. pkg/web/
+          cp -r backend/deploy/iis pkg/deploy/iis
+          printf '{"sha":"%s","built_at":"%s","run":"%s/%s/actions/runs/%s"}\n' \
+            "$GITHUB_SHA" "$(date -u +%FT%TZ)" "$GITHUB_SERVER_URL" "$GITHUB_REPOSITORY" "$GITHUB_RUN_ID" > pkg/manifest.json
+          ls pkg/dist
+      - name: Zip and checksum
+        run: |
+          set -eu
+          short=${GITHUB_SHA::7}
+          (cd pkg && zip -qr "../relaya-$short.zip" .)
+          sha256sum "relaya-$short.zip" | cut -d' ' -f1 > "relaya-$short.zip.sha256"
+          cp pkg/manifest.json manifest.json
+          cat "relaya-$short.zip.sha256"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: package
+          path: |
+            relaya-*.zip
+            relaya-*.zip.sha256
+            manifest.json
+          retention-days: 7
+
+  publish:
+    needs: package
+    runs-on: ubuntu-latest
+    environment: production
+    permissions:
+      contents: write # replace the "production" release
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: package
+      - name: Publish the production release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -eu
+          short=${GITHUB_SHA::7}
+          gh release delete production --cleanup-tag --yes || true
+          gh release create production relaya-*.zip relaya-*.zip.sha256 manifest.json \
+            --target "$GITHUB_SHA" --prerelease \
+            --title "Production build $short" \
+            --notes "Tested build of $GITHUB_SHA for the Windows/IIS server. The server's auto-deploy task installs it within a few minutes. Built by $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID."
+          # gh uploads the files to a draft and then publishes it. That last step once
+          # left the release a draft while the job still passed, and the server (which
+          # reads it anonymously) saw nothing. Publish it if needed, and fail if it isn't public.
+          if [ "$(gh release view production --json isDraft --jq .isDraft)" = "true" ]; then
+            gh release edit production --draft=false
+          fi
+          test "$(gh release view production --json isDraft --jq .isDraft)" = "false"
+          for i in 1 2 3 4 5 6; do
+            curl -sf -o /dev/null "https://api.github.com/repos/$GH_REPO/releases/tags/production" && break
+            [ "$i" = 6 ] && { echo "::error::The production release isn't publicly visible"; exit 1; }
+            sleep 5
+          done
+          echo "Published production build $short" >> "$GITHUB_STEP_SUMMARY"
